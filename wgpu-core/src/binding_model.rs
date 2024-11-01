@@ -6,8 +6,8 @@ use crate::{
     init_tracker::{BufferInitTrackerAction, TextureInitTrackerAction},
     pipeline::{ComputePipeline, RenderPipeline},
     resource::{
-        Buffer, DestroyedResourceError, Labeled, MissingBufferUsageError, MissingTextureUsageError,
-        ResourceErrorIdent, Sampler, TextureView, TrackingData,
+        Buffer, DestroyedResourceError, InvalidResourceError, Labeled, MissingBufferUsageError,
+        MissingTextureUsageError, ResourceErrorIdent, Sampler, TextureView, TrackingData,
     },
     resource_log,
     snatch::{SnatchGuard, Snatchable},
@@ -17,7 +17,6 @@ use crate::{
 
 use arrayvec::ArrayVec;
 
-use once_cell::sync::OnceCell;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
 #[cfg(feature = "serde")]
@@ -27,7 +26,7 @@ use std::{
     borrow::Cow,
     mem::ManuallyDrop,
     ops::Range,
-    sync::{Arc, Weak},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use thiserror::Error;
@@ -79,14 +78,6 @@ pub enum CreateBindGroupLayoutError {
 pub enum CreateBindGroupError {
     #[error(transparent)]
     Device(#[from] DeviceError),
-    #[error("Bind group layout is invalid")]
-    InvalidLayout,
-    #[error("BufferId {0:?} is invalid")]
-    InvalidBufferId(BufferId),
-    #[error("TextureViewId {0:?} is invalid")]
-    InvalidTextureViewId(TextureViewId),
-    #[error("SamplerId {0:?} is invalid")]
-    InvalidSamplerId(SamplerId),
     #[error(transparent)]
     DestroyedResource(#[from] DestroyedResourceError),
     #[error(
@@ -188,6 +179,8 @@ pub enum CreateBindGroupError {
     StorageReadNotSupported(wgt::TextureFormat),
     #[error(transparent)]
     ResourceUsageCompatibility(#[from] ResourceUsageCompatibilityError),
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -379,10 +372,6 @@ impl BindingTypeMaxCountValidator {
             limits.max_sampled_textures_per_shader_stage,
             BindingTypeMaxCountErrorKind::SampledTextures,
         )?;
-        self.storage_buffers.validate(
-            limits.max_storage_buffers_per_shader_stage,
-            BindingTypeMaxCountErrorKind::StorageBuffers,
-        )?;
         self.samplers.validate(
             limits.max_samplers_per_shader_stage,
             BindingTypeMaxCountErrorKind::Samplers,
@@ -508,7 +497,7 @@ pub struct BindGroupLayout {
     /// We cannot unconditionally remove from the pool, as BGLs that don't come from the pool
     /// (derived BGLs) must not be removed.
     pub(crate) origin: bgl::Origin,
-    pub(crate) exclusive_pipeline: OnceCell<ExclusivePipeline>,
+    pub(crate) exclusive_pipeline: OnceLock<ExclusivePipeline>,
     #[allow(unused)]
     pub(crate) binding_count_validator: BindingTypeMaxCountValidator,
     /// The `label` from the descriptor used to create the resource.
@@ -545,8 +534,6 @@ impl BindGroupLayout {
 pub enum CreatePipelineLayoutError {
     #[error(transparent)]
     Device(#[from] DeviceError),
-    #[error("BindGroupLayoutId {0:?} is invalid")]
-    InvalidBindGroupLayoutId(BindGroupLayoutId),
     #[error(
         "Push constant at index {index} has range bound {bound} not aligned to {}",
         wgt::PUSH_CONSTANT_ALIGNMENT
@@ -570,6 +557,8 @@ pub enum CreatePipelineLayoutError {
     TooManyBindings(BindingTypeMaxCountError),
     #[error("Bind group layout count {actual} exceeds device bind group limit {max}")]
     TooManyGroups { actual: usize, max: usize },
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -884,6 +873,16 @@ pub(crate) fn buffer_binding_type_alignment(
     }
 }
 
+pub(crate) fn buffer_binding_type_bounds_check_alignment(
+    alignments: &hal::Alignments,
+    binding_type: wgt::BufferBindingType,
+) -> wgt::BufferAddress {
+    match binding_type {
+        wgt::BufferBindingType::Uniform => alignments.uniform_bounds_check_alignment.get(),
+        wgt::BufferBindingType::Storage { .. } => wgt::COPY_BUFFER_ALIGNMENT,
+    }
+}
+
 #[derive(Debug)]
 pub struct BindGroup {
     pub(crate) raw: Snatchable<Box<dyn hal::DynBindGroup>>,
@@ -993,10 +992,10 @@ crate::impl_trackable!(BindGroup);
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum GetBindGroupLayoutError {
-    #[error("Pipeline is invalid")]
-    InvalidPipeline,
     #[error("Invalid group index {0}")]
     InvalidGroupIndex(u32),
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use crate::AtomicFenceValue;
 use arrayvec::ArrayVec;
 use std::sync::atomic::Ordering;
 
@@ -647,6 +648,10 @@ impl crate::Device for super::Device {
         self.counters.buffers.sub(1);
     }
 
+    unsafe fn add_raw_buffer(&self, _buffer: &super::Buffer) {
+        self.counters.buffers.add(1);
+    }
+
     unsafe fn map_buffer(
         &self,
         buffer: &super::Buffer,
@@ -980,6 +985,10 @@ impl crate::Device for super::Device {
         drop(texture.drop_guard);
 
         self.counters.textures.sub(1);
+    }
+
+    unsafe fn add_raw_texture(&self, _texture: &super::Texture) {
+        self.counters.textures.add(1);
     }
 
     unsafe fn create_texture_view(
@@ -1526,7 +1535,7 @@ impl crate::Device for super::Device {
     unsafe fn create_fence(&self) -> Result<super::Fence, crate::DeviceError> {
         self.counters.fences.add(1);
         Ok(super::Fence {
-            last_completed: 0,
+            last_completed: AtomicFenceValue::new(0),
             pending: Vec::new(),
         })
     }
@@ -1552,7 +1561,7 @@ impl crate::Device for super::Device {
         wait_value: crate::FenceValue,
         timeout_ms: u32,
     ) -> Result<bool, crate::DeviceError> {
-        if fence.last_completed < wait_value {
+        if fence.last_completed.load(Ordering::Relaxed) < wait_value {
             let gl = &self.shared.context.lock();
             let timeout_ns = if cfg!(any(webgl, Emscripten)) {
                 0
@@ -1564,19 +1573,25 @@ impl crate::Device for super::Device {
                 .iter()
                 .find(|&&(value, _)| value >= wait_value)
             {
-                return match unsafe {
+                let signalled = match unsafe {
                     gl.client_wait_sync(sync, glow::SYNC_FLUSH_COMMANDS_BIT, timeout_ns as i32)
                 } {
                     // for some reason firefox returns WAIT_FAILED, to investigate
                     #[cfg(any(webgl, Emscripten))]
                     glow::WAIT_FAILED => {
                         log::warn!("wait failed!");
-                        Ok(false)
+                        false
                     }
-                    glow::TIMEOUT_EXPIRED => Ok(false),
-                    glow::CONDITION_SATISFIED | glow::ALREADY_SIGNALED => Ok(true),
-                    _ => Err(crate::DeviceError::Lost),
+                    glow::TIMEOUT_EXPIRED => false,
+                    glow::CONDITION_SATISFIED | glow::ALREADY_SIGNALED => true,
+                    _ => return Err(crate::DeviceError::Lost),
                 };
+                if signalled {
+                    fence
+                        .last_completed
+                        .fetch_max(wait_value, Ordering::Relaxed);
+                }
+                return Ok(signalled);
             }
         }
         Ok(true)

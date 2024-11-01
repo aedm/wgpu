@@ -1,3 +1,10 @@
+use crate::diagnostic_filter::FilterableTriggeringRule;
+use crate::front::wgsl::parse::directive::enable_extension::{
+    EnableExtension, UnimplementedEnableExtension,
+};
+use crate::front::wgsl::parse::directive::language_extension::{
+    LanguageExtension, UnimplementedLanguageExtension,
+};
 use crate::front::wgsl::parse::lexer::Token;
 use crate::front::wgsl::Scalar;
 use crate::proc::{Alignment, ConstantEvaluatorError, ResolveError};
@@ -111,6 +118,8 @@ impl std::error::Error for ParseError {
 pub enum ExpectedToken<'a> {
     Token(Token<'a>),
     Identifier,
+    AfterIdentListComma,
+    AfterIdentListArg,
     /// Expected: constant, parenthesized expression, identifier
     PrimaryExpression,
     /// Expected: assignment, increment/decrement expression
@@ -183,6 +192,9 @@ pub(crate) enum Error<'a> {
     UnknownType(Span),
     UnknownStorageFormat(Span),
     UnknownConservativeDepth(Span),
+    UnknownEnableExtension(Span, &'a str),
+    UnknownLanguageExtension(Span, &'a str),
+    UnknownDiagnosticRuleName(Span),
     SizeAttributeTooLow(Span, u32),
     AlignAttributeTooLow(Span, Alignment),
     NonPowerOfTwoAlignAttribute(Span),
@@ -263,6 +275,30 @@ pub(crate) enum Error<'a> {
         limit: u8,
     },
     PipelineConstantIDValue(Span),
+    NotBool(Span),
+    ConstAssertFailed(Span),
+    DirectiveAfterFirstGlobalDecl {
+        directive_span: Span,
+    },
+    EnableExtensionNotYetImplemented {
+        kind: UnimplementedEnableExtension,
+        span: Span,
+    },
+    EnableExtensionNotEnabled {
+        kind: EnableExtension,
+        span: Span,
+    },
+    LanguageExtensionNotYetImplemented {
+        kind: UnimplementedLanguageExtension,
+        span: Span,
+    },
+    DiagnosticInvalidSeverity {
+        severity_control_name_span: Span,
+    },
+    DiagnosticNotYetImplemented {
+        triggering_rule: FilterableTriggeringRule,
+        span: Span,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -296,35 +332,51 @@ impl<'a> Error<'a> {
         match *self {
             Error::Unexpected(unexpected_span, expected) => {
                 let expected_str = match expected {
-                    ExpectedToken::Token(token) => {
-                        match token {
-                            Token::Separator(c) => format!("'{c}'"),
-                            Token::Paren(c) => format!("'{c}'"),
-                            Token::Attribute => "@".to_string(),
-                            Token::Number(_) => "number".to_string(),
-                            Token::Word(s) => s.to_string(),
-                            Token::Operation(c) => format!("operation ('{c}')"),
-                            Token::LogicalOperation(c) => format!("logical operation ('{c}')"),
-                            Token::ShiftOperation(c) => format!("bitshift ('{c}{c}')"),
-                            Token::AssignmentOperation(c) if c=='<' || c=='>' => format!("bitshift ('{c}{c}=')"),
-                            Token::AssignmentOperation(c) => format!("operation ('{c}=')"),
-                            Token::IncrementOperation => "increment operation".to_string(),
-                            Token::DecrementOperation => "decrement operation".to_string(),
-                            Token::Arrow => "->".to_string(),
-                            Token::Unknown(c) => format!("unknown ('{c}')"),
-                            Token::Trivia => "trivia".to_string(),
-                            Token::End => "end".to_string(),
+                    ExpectedToken::Token(token) => match token {
+                        Token::Separator(c) => format!("'{c}'"),
+                        Token::Paren(c) => format!("'{c}'"),
+                        Token::Attribute => "@".to_string(),
+                        Token::Number(_) => "number".to_string(),
+                        Token::Word(s) => s.to_string(),
+                        Token::Operation(c) => format!("operation ('{c}')"),
+                        Token::LogicalOperation(c) => format!("logical operation ('{c}')"),
+                        Token::ShiftOperation(c) => format!("bitshift ('{c}{c}')"),
+                        Token::AssignmentOperation(c) if c == '<' || c == '>' => {
+                            format!("bitshift ('{c}{c}=')")
                         }
-                    }
+                        Token::AssignmentOperation(c) => format!("operation ('{c}=')"),
+                        Token::IncrementOperation => "increment operation".to_string(),
+                        Token::DecrementOperation => "decrement operation".to_string(),
+                        Token::Arrow => "->".to_string(),
+                        Token::Unknown(c) => format!("unknown ('{c}')"),
+                        Token::Trivia => "trivia".to_string(),
+                        Token::End => "end".to_string(),
+                    },
                     ExpectedToken::Identifier => "identifier".to_string(),
                     ExpectedToken::PrimaryExpression => "expression".to_string(),
                     ExpectedToken::Assignment => "assignment or increment/decrement".to_string(),
-                    ExpectedToken::SwitchItem => "switch item ('case' or 'default') or a closing curly bracket to signify the end of the switch statement ('}')".to_string(),
-                    ExpectedToken::WorkgroupSizeSeparator => "workgroup size separator (',') or a closing parenthesis".to_string(),
-                    ExpectedToken::GlobalItem => "global item ('struct', 'const', 'var', 'alias', ';', 'fn') or the end of the file".to_string(),
+                    ExpectedToken::SwitchItem => concat!(
+                        "switch item ('case' or 'default') or a closing curly bracket ",
+                        "to signify the end of the switch statement ('}')"
+                    )
+                    .to_string(),
+                    ExpectedToken::WorkgroupSizeSeparator => {
+                        "workgroup size separator (',') or a closing parenthesis".to_string()
+                    }
+                    ExpectedToken::GlobalItem => concat!(
+                        "global item ('struct', 'const', 'var', 'alias', ';', 'fn') ",
+                        "or the end of the file"
+                    )
+                    .to_string(),
                     ExpectedToken::Type => "type".to_string(),
                     ExpectedToken::Variable => "variable access".to_string(),
                     ExpectedToken::Function => "function name".to_string(),
+                    ExpectedToken::AfterIdentListArg => {
+                        "next argument, trailing comma, or end of list (',' or ';')".to_string()
+                    }
+                    ExpectedToken::AfterIdentListComma => {
+                        "next argument or end of list (';')".to_string()
+                    }
                 };
                 ParseError {
                     message: format!(
@@ -382,9 +434,11 @@ impl<'a> Error<'a> {
                 notes: vec![],
             },
             Error::BadIncrDecrReferenceType(span) => ParseError {
-                message:
-                    "increment/decrement operation requires reference type to be one of i32 or u32"
-                        .to_string(),
+                message: concat!(
+                    "increment/decrement operation requires ",
+                    "reference type to be one of i32 or u32"
+                )
+                .to_string(),
                 labels: vec![(span, "must be a reference type of i32 or u32".into())],
                 notes: vec![],
             },
@@ -495,6 +549,32 @@ impl<'a> Error<'a> {
                 labels: vec![(bad_span, "unknown type".into())],
                 notes: vec![],
             },
+            Error::UnknownEnableExtension(span, word) => ParseError {
+                message: format!("unknown enable-extension `{}`", word),
+                labels: vec![(span, "".into())],
+                notes: vec![
+                    "See available extensions at <https://www.w3.org/TR/WGSL/#enable-extension>."
+                        .into(),
+                ],
+            },
+            Error::UnknownLanguageExtension(span, name) => ParseError {
+                message: format!("unknown language extension `{name}`"),
+                labels: vec![(span, "".into())],
+                notes: vec![concat!(
+                    "See available extensions at ",
+                    "<https://www.w3.org/TR/WGSL/#language-extensions-sec>."
+                )
+                .into()],
+            },
+            Error::UnknownDiagnosticRuleName(span) => ParseError {
+                message: format!("unknown `diagnostic(…)` rule name `{}`", &source[span]),
+                labels: vec![(span, "not a valid diagnostic rule name".into())],
+                notes: vec![concat!(
+                    "See available trigger rules at ",
+                    "<https://www.w3.org/TR/WGSL/#filterable-triggering-rules>."
+                )
+                .into()],
+            },
             Error::SizeAttributeTooLow(bad_span, min_size) => ParseError {
                 message: format!("struct member size must be at least {min_size}"),
                 labels: vec![(bad_span, format!("must be at least {min_size}").into())],
@@ -525,25 +605,24 @@ impl<'a> Error<'a> {
                 labels: vec![(span, "type can't be inferred".into())],
                 notes: vec![],
             },
-            Error::InitializationTypeMismatch { name, ref expected, ref got } => {
-                ParseError {
-                    message: format!(
-                        "the type of `{}` is expected to be `{}`, but got `{}`",
-                        &source[name], expected, got,
-                    ),
-                    labels: vec![(
-                        name,
-                        format!("definition of `{}`", &source[name]).into(),
-                    )],
-                    notes: vec![],
-                }
-            }
+            Error::InitializationTypeMismatch {
+                name,
+                ref expected,
+                ref got,
+            } => ParseError {
+                message: format!(
+                    "the type of `{}` is expected to be `{}`, but got `{}`",
+                    &source[name], expected, got,
+                ),
+                labels: vec![(name, format!("definition of `{}`", &source[name]).into())],
+                notes: vec![],
+            },
             Error::DeclMissingTypeAndInit(name_span) => ParseError {
-                message: format!("declaration of `{}` needs a type specifier or initializer", &source[name_span]),
-                labels: vec![(
-                    name_span,
-                    "needs a type specifier or initializer".into(),
-                )],
+                message: format!(
+                    "declaration of `{}` needs a type specifier or initializer",
+                    &source[name_span]
+                ),
+                labels: vec![(name_span, "needs a type specifier or initializer".into())],
                 notes: vec![],
             },
             Error::MissingAttribute(name, name_span) => ParseError {
@@ -723,7 +802,11 @@ impl<'a> Error<'a> {
                 notes: vec![message.into()],
             },
             Error::ExpectedConstExprConcreteIntegerScalar(span) => ParseError {
-                message: "must be a const-expression that resolves to a concrete integer scalar (u32 or i32)".to_string(),
+                message: concat!(
+                    "must be a const-expression that ",
+                    "resolves to a concrete integer scalar (u32 or i32)"
+                )
+                .to_string(),
                 labels: vec![(span, "must resolve to u32 or i32".into())],
                 notes: vec![],
             },
@@ -752,9 +835,17 @@ impl<'a> Error<'a> {
             },
             Error::AutoConversion(ref error) => {
                 // destructuring ensures all fields are handled
-                let AutoConversionError { dest_span, ref dest_type, source_span, ref source_type } = **error;
+                let AutoConversionError {
+                    dest_span,
+                    ref dest_type,
+                    source_span,
+                    ref source_type,
+                } = **error;
                 ParseError {
-                    message: format!("automatic conversions cannot convert `{source_type}` to `{dest_type}`"),
+                    message: format!(
+                        "automatic conversions cannot convert `{}` to `{}`",
+                        source_type, dest_type
+                    ),
                     labels: vec![
                         (
                             dest_span,
@@ -763,57 +854,186 @@ impl<'a> Error<'a> {
                         (
                             source_span,
                             format!("this expression has type {source_type}").into(),
-                        )
+                        ),
                     ],
                     notes: vec![],
                 }
-            },
+            }
             Error::AutoConversionLeafScalar(ref error) => {
-                let AutoConversionLeafScalarError { dest_span, ref dest_scalar, source_span, ref source_type } = **error;
+                let AutoConversionLeafScalarError {
+                    dest_span,
+                    ref dest_scalar,
+                    source_span,
+                    ref source_type,
+                } = **error;
                 ParseError {
-                    message: format!("automatic conversions cannot convert elements of `{source_type}` to `{dest_scalar}`"),
+                    message: format!(
+                        "automatic conversions cannot convert elements of `{}` to `{}`",
+                        source_type, dest_scalar
+                    ),
                     labels: vec![
                         (
                             dest_span,
-                            format!("a value with elements of type {dest_scalar} is required here").into(),
+                            format!(
+                                "a value with elements of type {} is required here",
+                                dest_scalar
+                            )
+                            .into(),
                         ),
                         (
                             source_span,
                             format!("this expression has type {source_type}").into(),
-                        )
+                        ),
                     ],
                     notes: vec![],
                 }
-            },
+            }
             Error::ConcretizationFailed(ref error) => {
-                let ConcretizationFailedError { expr_span, ref expr_type, ref scalar, ref inner } = **error;
+                let ConcretizationFailedError {
+                    expr_span,
+                    ref expr_type,
+                    ref scalar,
+                    ref inner,
+                } = **error;
                 ParseError {
-                    message: format!("failed to convert expression to a concrete type: {}", inner),
-                    labels: vec![
-                        (
-                            expr_span,
-                            format!("this expression has type {}", expr_type).into(),
-                        )
-                    ],
-                    notes: vec![
-                        format!("the expression should have been converted to have {} scalar type", scalar),
-                    ]
+                    message: format!("failed to convert expression to a concrete type: {inner}"),
+                    labels: vec![(
+                        expr_span,
+                        format!("this expression has type {expr_type}").into(),
+                    )],
+                    notes: vec![format!(
+                        "the expression should have been converted to have {} scalar type",
+                        scalar
+                    )],
                 }
-            },
+            }
             Error::ExceededLimitForNestedBraces { span, limit } => ParseError {
                 message: "brace nesting limit reached".into(),
                 labels: vec![(span, "limit reached at this brace".into())],
-                notes: vec![
-                    format!("nesting limit is currently set to {limit}"),
-                ],
+                notes: vec![format!("nesting limit is currently set to {limit}")],
             },
             Error::PipelineConstantIDValue(span) => ParseError {
                 message: "pipeline constant ID must be between 0 and 65535 inclusive".to_string(),
+                labels: vec![(span, "must be between 0 and 65535 inclusive".into())],
+                notes: vec![],
+            },
+            Error::NotBool(span) => ParseError {
+                message: "must be a const-expression that resolves to a bool".to_string(),
+                labels: vec![(span, "must resolve to bool".into())],
+                notes: vec![],
+            },
+            Error::ConstAssertFailed(span) => ParseError {
+                message: "const_assert failure".to_string(),
+                labels: vec![(span, "evaluates to false".into())],
+                notes: vec![],
+            },
+            Error::DirectiveAfterFirstGlobalDecl { directive_span } => ParseError {
+                message: "expected global declaration, but found a global directive".into(),
+                labels: vec![(
+                    directive_span,
+                    "written after first global declaration".into(),
+                )],
+                notes: vec![concat!(
+                    "global directives are only allowed before global declarations; ",
+                    "maybe hoist this closer to the top of the shader module?"
+                )
+                .into()],
+            },
+            Error::EnableExtensionNotYetImplemented { kind, span } => ParseError {
+                message: format!(
+                    "the `{}` enable-extension is not yet supported",
+                    EnableExtension::Unimplemented(kind).to_ident()
+                ),
                 labels: vec![(
                     span,
-                    "must be between 0 and 65535 inclusive".into(),
+                    concat!(
+                        "this enable-extension specifies standard functionality ",
+                        "which is not yet implemented in Naga"
+                    )
+                    .into(),
                 )],
-                notes: vec![],
+                notes: vec![format!(
+                    concat!(
+                        "Let Naga maintainers know that you ran into this at ",
+                        "<https://github.com/gfx-rs/wgpu/issues/{}>, ",
+                        "so they can prioritize it!"
+                    ),
+                    kind.tracking_issue_num()
+                )],
+            },
+            Error::EnableExtensionNotEnabled { kind, span } => ParseError {
+                message: format!("`{}` enable-extension is not enabled", kind.to_ident()),
+                labels: vec![(
+                    span,
+                    format!(
+                        concat!(
+                            "the `{}` enable-extension is needed for this functionality, ",
+                            "but it is not currently enabled"
+                        ),
+                        kind.to_ident()
+                    )
+                    .into(),
+                )],
+                notes: if let EnableExtension::Unimplemented(kind) = kind {
+                    vec![format!(
+                        concat!(
+                            "This enable-extension is not yet implemented. ",
+                            "Let Naga maintainers know that you ran into this at ",
+                            "<https://github.com/gfx-rs/wgpu/issues/{}>, ",
+                            "so they can prioritize it!"
+                        ),
+                        kind.tracking_issue_num()
+                    )]
+                } else {
+                    vec![]
+                },
+            },
+            Error::LanguageExtensionNotYetImplemented { kind, span } => ParseError {
+                message: format!(
+                    "the `{}` language extension is not yet supported",
+                    LanguageExtension::Unimplemented(kind).to_ident()
+                ),
+                labels: vec![(span, "".into())],
+                notes: vec![format!(
+                    concat!(
+                        "Let Naga maintainers know that you ran into this at ",
+                        "<https://github.com/gfx-rs/wgpu/issues/{}>, ",
+                        "so they can prioritize it!"
+                    ),
+                    kind.tracking_issue_num()
+                )],
+            },
+            Error::DiagnosticInvalidSeverity {
+                severity_control_name_span,
+            } => ParseError {
+                message: "invalid `diagnostic(…)` severity".into(),
+                labels: vec![(
+                    severity_control_name_span,
+                    "not a valid severity level".into(),
+                )],
+                notes: vec![concat!(
+                    "See available severities at ",
+                    "<https://www.w3.org/TR/WGSL/#diagnostic-severity>."
+                )
+                .into()],
+            },
+            Error::DiagnosticNotYetImplemented {
+                triggering_rule,
+                span,
+            } => ParseError {
+                message: format!(
+                    "the `{}` diagnostic filter is not yet supported",
+                    triggering_rule.to_ident()
+                ),
+                labels: vec![(span, "".into())],
+                notes: vec![format!(
+                    concat!(
+                        "Let Naga maintainers know that you ran into this at ",
+                        "<https://github.com/gfx-rs/wgpu/issues/{}>, ",
+                        "so they can prioritize it!"
+                    ),
+                    triggering_rule.tracking_issue_num()
+                )],
             },
         }
     }

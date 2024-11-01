@@ -252,7 +252,6 @@ impl Device {
         Texture {
             context: Arc::clone(&self.context),
             data,
-            owned: true,
             descriptor: TextureDescriptor {
                 label: None,
                 view_formats: &[],
@@ -291,7 +290,6 @@ impl Device {
         Texture {
             context: Arc::clone(&self.context),
             data: Box::new(texture),
-            owned: true,
             descriptor: TextureDescriptor {
                 label: None,
                 view_formats: &[],
@@ -462,12 +460,6 @@ impl Device {
             self.data.as_ref(),
             Box::new(callback),
         )
-    }
-
-    /// Test-only function to make this device invalid.
-    #[doc(hidden)]
-    pub fn make_invalid(&self) {
-        DynContext::device_make_invalid(&*self.context, self.data.as_ref())
     }
 
     /// Create a [`PipelineCache`] with initial data

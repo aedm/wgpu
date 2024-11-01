@@ -14,6 +14,7 @@ use crate::{
     resource_log,
     snatch::{SnatchGuard, Snatchable},
     track::{SharedTrackerIndexAllocator, TextureSelector, TrackerIndex},
+    weak_vec::WeakVec,
     Label, LabelHelpers,
 };
 
@@ -26,7 +27,7 @@ use std::{
     mem::{self, ManuallyDrop},
     ops::Range,
     ptr::NonNull,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 /// Information about the wgpu-core resource.
@@ -86,7 +87,7 @@ impl std::fmt::Display for ResourceErrorIdent {
     }
 }
 
-pub(crate) trait ParentDevice: Labeled {
+pub trait ParentDevice: Labeled {
     fn device(&self) -> &Arc<Device>;
 
     fn is_equal(self: &Arc<Self>, other: &Arc<Self>) -> bool {
@@ -106,8 +107,8 @@ pub(crate) trait ParentDevice: Labeled {
         }
     }
 
-    fn same_device(&self, device: &Arc<Device>) -> Result<(), DeviceError> {
-        if Arc::ptr_eq(self.device(), device) {
+    fn same_device(&self, device: &Device) -> Result<(), DeviceError> {
+        if std::ptr::eq(&**self.device(), device) {
             Ok(())
         } else {
             Err(DeviceError::DeviceMismatch(Box::new(DeviceMismatch {
@@ -131,7 +132,7 @@ macro_rules! impl_parent_device {
     };
 }
 
-pub(crate) trait ResourceType {
+pub trait ResourceType {
     const TYPE: &'static str;
 }
 
@@ -144,7 +145,7 @@ macro_rules! impl_resource_type {
     };
 }
 
-pub(crate) trait Labeled: ResourceType {
+pub trait Labeled: ResourceType {
     /// Returns a string identifying this resource for logging and errors.
     ///
     /// It may be a user-provided string or it may be a placeholder from wgpu.
@@ -305,7 +306,7 @@ impl BufferMapCallback {
                 let status = match result {
                     Ok(()) => BufferMapAsyncStatus::Success,
                     Err(BufferAccessError::Device(_)) => BufferMapAsyncStatus::ContextLost,
-                    Err(BufferAccessError::InvalidBufferId(_))
+                    Err(BufferAccessError::InvalidResource(_))
                     | Err(BufferAccessError::DestroyedResource(_)) => BufferMapAsyncStatus::Invalid,
                     Err(BufferAccessError::AlreadyMapped) => BufferMapAsyncStatus::AlreadyMapped,
                     Err(BufferAccessError::MapAlreadyPending) => {
@@ -324,7 +325,9 @@ impl BufferMapCallback {
                     | Err(BufferAccessError::NegativeRange { .. }) => {
                         BufferMapAsyncStatus::InvalidRange
                     }
-                    Err(_) => BufferMapAsyncStatus::Error,
+                    Err(BufferAccessError::Failed)
+                    | Err(BufferAccessError::NotMapped)
+                    | Err(BufferAccessError::MapAborted) => BufferMapAsyncStatus::Error,
                 };
 
                 (inner.callback)(status, inner.user_data);
@@ -347,8 +350,6 @@ pub enum BufferAccessError {
     Device(#[from] DeviceError),
     #[error("Buffer map failed")]
     Failed,
-    #[error("BufferId {0:?} is invalid")]
-    InvalidBufferId(BufferId),
     #[error(transparent)]
     DestroyedResource(#[from] DestroyedResourceError),
     #[error("Buffer is already mapped")]
@@ -386,6 +387,8 @@ pub enum BufferAccessError {
     },
     #[error("Buffer map aborted")]
     MapAborted,
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -410,6 +413,45 @@ pub struct MissingTextureUsageError {
 #[error("{0} has been destroyed")]
 pub struct DestroyedResourceError(pub ResourceErrorIdent);
 
+#[derive(Clone, Debug, Error)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[error("{0} is invalid")]
+pub struct InvalidResourceError(pub ResourceErrorIdent);
+
+pub enum Fallible<T: ParentDevice> {
+    Valid(Arc<T>),
+    Invalid(Arc<String>),
+}
+
+impl<T: ParentDevice> Fallible<T> {
+    pub fn get(self) -> Result<Arc<T>, InvalidResourceError> {
+        match self {
+            Fallible::Valid(v) => Ok(v),
+            Fallible::Invalid(label) => Err(InvalidResourceError(ResourceErrorIdent {
+                r#type: Cow::Borrowed(T::TYPE),
+                label: (*label).clone(),
+            })),
+        }
+    }
+}
+
+impl<T: ParentDevice> Clone for Fallible<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Valid(v) => Self::Valid(v.clone()),
+            Self::Invalid(l) => Self::Invalid(l.clone()),
+        }
+    }
+}
+
+impl<T: ParentDevice> ResourceType for Fallible<T> {
+    const TYPE: &'static str = T::TYPE;
+}
+
+impl<T: ParentDevice + crate::storage::StorageItem> crate::storage::StorageItem for Fallible<T> {
+    type Marker = T::Marker;
+}
+
 pub type BufferAccessResult = Result<(), BufferAccessError>;
 
 #[derive(Debug)]
@@ -433,11 +475,19 @@ pub struct Buffer {
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
     pub(crate) map_state: Mutex<BufferMapState>,
-    pub(crate) bind_groups: Mutex<Vec<Weak<BindGroup>>>,
+    pub(crate) bind_groups: Mutex<WeakVec<BindGroup>>,
+    #[cfg(feature = "indirect-validation")]
+    pub(crate) raw_indirect_validation_bind_group: Snatchable<Box<dyn hal::DynBindGroup>>,
 }
 
 impl Drop for Buffer {
     fn drop(&mut self) {
+        #[cfg(feature = "indirect-validation")]
+        if let Some(raw) = self.raw_indirect_validation_bind_group.take() {
+            unsafe {
+                self.device.raw().destroy_bind_group(raw);
+            }
+        }
         if let Some(raw) = self.raw.take() {
             resource_log!("Destroy raw {}", self.error_ident());
             unsafe {
@@ -696,13 +746,21 @@ impl Buffer {
         let device = &self.device;
 
         let temp = {
-            let snatch_guard = device.snatchable_lock.write();
-            let raw = match self.raw.snatch(snatch_guard) {
+            let mut snatch_guard = device.snatchable_lock.write();
+
+            let raw = match self.raw.snatch(&mut snatch_guard) {
                 Some(raw) => raw,
                 None => {
                     return Err(DestroyError::AlreadyDestroyed);
                 }
             };
+
+            #[cfg(feature = "indirect-validation")]
+            let raw_indirect_validation_bind_group = self
+                .raw_indirect_validation_bind_group
+                .snatch(&mut snatch_guard);
+
+            drop(snatch_guard);
 
             let bind_groups = {
                 let mut guard = self.bind_groups.lock();
@@ -714,6 +772,8 @@ impl Buffer {
                 device: Arc::clone(&self.device),
                 label: self.label().to_owned(),
                 bind_groups,
+                #[cfg(feature = "indirect-validation")]
+                raw_indirect_validation_bind_group,
             })
         };
 
@@ -749,6 +809,8 @@ pub enum CreateBufferError {
     MaxBufferSize { requested: u64, maximum: u64 },
     #[error(transparent)]
     MissingDownlevelFlags(#[from] MissingDownlevelFlags),
+    #[error("Failed to create bind group for indirect buffer validation: {0}")]
+    IndirectValidationBindGroup(DeviceError),
 }
 
 crate::impl_resource_type!(Buffer);
@@ -763,7 +825,9 @@ pub struct DestroyedBuffer {
     raw: ManuallyDrop<Box<dyn hal::DynBuffer>>,
     device: Arc<Device>,
     label: String,
-    bind_groups: Vec<Weak<BindGroup>>,
+    bind_groups: WeakVec<BindGroup>,
+    #[cfg(feature = "indirect-validation")]
+    raw_indirect_validation_bind_group: Option<Box<dyn hal::DynBindGroup>>,
 }
 
 impl DestroyedBuffer {
@@ -775,10 +839,17 @@ impl DestroyedBuffer {
 impl Drop for DestroyedBuffer {
     fn drop(&mut self) {
         let mut deferred = self.device.deferred_destroy.lock();
-        for bind_group in self.bind_groups.drain(..) {
-            deferred.push(DeferredDestroy::BindGroup(bind_group));
-        }
+        deferred.push(DeferredDestroy::BindGroups(mem::take(
+            &mut self.bind_groups,
+        )));
         drop(deferred);
+
+        #[cfg(feature = "indirect-validation")]
+        if let Some(raw) = self.raw_indirect_validation_bind_group.take() {
+            unsafe {
+                self.device.raw().destroy_bind_group(raw);
+            }
+        }
 
         resource_log!("Destroy raw Buffer (destroyed) {:?}", self.label());
         // SAFETY: We are in the Drop impl and we don't use self.raw anymore after this point.
@@ -832,8 +903,10 @@ impl StagingBuffer {
             memory_flags: hal::MemoryFlags::TRANSIENT,
         };
 
-        let raw = unsafe { device.raw().create_buffer(&stage_desc)? };
-        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }?;
+        let raw = unsafe { device.raw().create_buffer(&stage_desc) }
+            .map_err(|e| device.handle_hal_error(e))?;
+        let mapping = unsafe { device.raw().map_buffer(raw.as_ref(), 0..size.get()) }
+            .map_err(|e| device.handle_hal_error(e))?;
 
         let staging_buffer = StagingBuffer {
             raw,
@@ -947,7 +1020,6 @@ pub(crate) enum TextureInner {
     },
     Surface {
         raw: Box<dyn hal::DynSurfaceTexture>,
-        parent_id: SurfaceId,
     },
 }
 
@@ -989,8 +1061,8 @@ pub struct Texture {
     pub(crate) label: String,
     pub(crate) tracking_data: TrackingData,
     pub(crate) clear_mode: TextureClearMode,
-    pub(crate) views: Mutex<Vec<Weak<TextureView>>>,
-    pub(crate) bind_groups: Mutex<Vec<Weak<BindGroup>>>,
+    pub(crate) views: Mutex<WeakVec<TextureView>>,
+    pub(crate) bind_groups: Mutex<WeakVec<BindGroup>>,
 }
 
 impl Texture {
@@ -1014,7 +1086,7 @@ impl Texture {
                 if init {
                     TextureInitTracker::new(desc.mip_level_count, desc.array_layer_count())
                 } else {
-                    TextureInitTracker::new(0, 0)
+                    TextureInitTracker::new(desc.mip_level_count, 0)
                 },
             ),
             full_range: TextureSelector {
@@ -1024,8 +1096,8 @@ impl Texture {
             label: desc.label.to_string(),
             tracking_data: TrackingData::new(device.tracker_indices.textures.clone()),
             clear_mode,
-            views: Mutex::new(rank::TEXTURE_VIEWS, Vec::new()),
-            bind_groups: Mutex::new(rank::TEXTURE_BIND_GROUPS, Vec::new()),
+            views: Mutex::new(rank::TEXTURE_VIEWS, WeakVec::new()),
+            bind_groups: Mutex::new(rank::TEXTURE_BIND_GROUPS, WeakVec::new()),
         }
     }
     /// Checks that the given texture usage contains the required texture usage,
@@ -1142,8 +1214,7 @@ impl Texture {
         let device = &self.device;
 
         let temp = {
-            let snatch_guard = device.snatchable_lock.write();
-            let raw = match self.inner.snatch(snatch_guard) {
+            let raw = match self.inner.snatch(&mut device.snatchable_lock.write()) {
                 Some(TextureInner::Native { raw }) => raw,
                 Some(TextureInner::Surface { .. }) => {
                     return Ok(());
@@ -1200,7 +1271,7 @@ impl Global {
 
         let hub = &self.hub;
 
-        if let Ok(buffer) = hub.buffers.get(id) {
+        if let Ok(buffer) = hub.buffers.get(id).get() {
             let snatch_guard = buffer.device.snatchable_lock.read();
             let hal_buffer = buffer
                 .raw(&snatch_guard)
@@ -1223,7 +1294,7 @@ impl Global {
 
         let hub = &self.hub;
 
-        if let Ok(texture) = hub.textures.get(id) {
+        if let Ok(texture) = hub.textures.get(id).get() {
             let snatch_guard = texture.device.snatchable_lock.read();
             let hal_texture = texture.raw(&snatch_guard);
             let hal_texture = hal_texture
@@ -1247,7 +1318,7 @@ impl Global {
 
         let hub = &self.hub;
 
-        if let Ok(texture_view) = hub.texture_views.get(id) {
+        if let Ok(texture_view) = hub.texture_views.get(id).get() {
             let snatch_guard = texture_view.device.snatchable_lock.read();
             let hal_texture_view = texture_view.raw(&snatch_guard);
             let hal_texture_view = hal_texture_view
@@ -1270,11 +1341,8 @@ impl Global {
         profiling::scope!("Adapter::as_hal");
 
         let hub = &self.hub;
-        let adapter = hub.adapters.get(id).ok();
-        let hal_adapter = adapter
-            .as_ref()
-            .map(|adapter| &adapter.raw.adapter)
-            .and_then(|adapter| adapter.as_any().downcast_ref());
+        let adapter = hub.adapters.get(id);
+        let hal_adapter = adapter.raw.adapter.as_any().downcast_ref();
 
         hal_adapter_callback(hal_adapter)
     }
@@ -1289,12 +1357,8 @@ impl Global {
     ) -> R {
         profiling::scope!("Device::as_hal");
 
-        let hub = &self.hub;
-        let device = hub.devices.get(id).ok();
-        let hal_device = device
-            .as_ref()
-            .map(|device| device.raw())
-            .and_then(|device| device.as_any().downcast_ref());
+        let device = self.hub.devices.get(id);
+        let hal_device = device.raw().as_any().downcast_ref();
 
         hal_device_callback(hal_device)
     }
@@ -1309,14 +1373,9 @@ impl Global {
     ) -> R {
         profiling::scope!("Device::fence_as_hal");
 
-        let hub = &self.hub;
-
-        if let Ok(device) = hub.devices.get(id) {
-            let fence = device.fence.read();
-            hal_fence_callback(fence.as_any().downcast_ref())
-        } else {
-            hal_fence_callback(None)
-        }
+        let device = self.hub.devices.get(id);
+        let fence = device.fence.read();
+        hal_fence_callback(fence.as_any().downcast_ref())
     }
 
     /// # Safety
@@ -1328,10 +1387,9 @@ impl Global {
     ) -> R {
         profiling::scope!("Surface::as_hal");
 
-        let surface = self.surfaces.get(id).ok();
+        let surface = self.surfaces.get(id);
         let hal_surface = surface
-            .as_ref()
-            .and_then(|surface| surface.raw(A::VARIANT))
+            .raw(A::VARIANT)
             .and_then(|surface| surface.as_any().downcast_ref());
 
         hal_surface_callback(hal_surface)
@@ -1353,12 +1411,13 @@ impl Global {
 
         let hub = &self.hub;
 
-        if let Ok(cmd_buf) = hub.command_buffers.get(id.into_command_buffer_id()) {
-            let mut cmd_buf_data = cmd_buf.data.lock();
-            let cmd_buf_data = cmd_buf_data.as_mut().unwrap();
+        let cmd_buf = hub.command_buffers.get(id.into_command_buffer_id());
+        let cmd_buf_data = cmd_buf.try_get();
+
+        if let Ok(mut cmd_buf_data) = cmd_buf_data {
             let cmd_buf_raw = cmd_buf_data
                 .encoder
-                .open()
+                .open(&cmd_buf.device)
                 .ok()
                 .and_then(|encoder| encoder.as_any_mut().downcast_mut());
             hal_command_encoder_callback(cmd_buf_raw)
@@ -1372,8 +1431,8 @@ impl Global {
 #[derive(Debug)]
 pub struct DestroyedTexture {
     raw: ManuallyDrop<Box<dyn hal::DynTexture>>,
-    views: Vec<Weak<TextureView>>,
-    bind_groups: Vec<Weak<BindGroup>>,
+    views: WeakVec<TextureView>,
+    bind_groups: WeakVec<BindGroup>,
     device: Arc<Device>,
     label: String,
 }
@@ -1389,12 +1448,10 @@ impl Drop for DestroyedTexture {
         let device = &self.device;
 
         let mut deferred = device.deferred_destroy.lock();
-        for view in self.views.drain(..) {
-            deferred.push(DeferredDestroy::TextureView(view));
-        }
-        for bind_group in self.bind_groups.drain(..) {
-            deferred.push(DeferredDestroy::BindGroup(bind_group));
-        }
+        deferred.push(DeferredDestroy::TextureViews(mem::take(&mut self.views)));
+        deferred.push(DeferredDestroy::BindGroups(mem::take(
+            &mut self.bind_groups,
+        )));
         drop(deferred);
 
         resource_log!("Destroy raw Texture (destroyed) {:?}", self.label());
@@ -1616,8 +1673,6 @@ impl TextureView {
 pub enum CreateTextureViewError {
     #[error(transparent)]
     Device(#[from] DeviceError),
-    #[error("TextureId {0:?} is invalid")]
-    InvalidTextureId(TextureId),
     #[error(transparent)]
     DestroyedResource(#[from] DestroyedResourceError),
     #[error("Not enough memory left to create texture view")]
@@ -1660,6 +1715,8 @@ pub enum CreateTextureViewError {
         texture: wgt::TextureFormat,
         view: wgt::TextureFormat,
     },
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -1832,8 +1889,8 @@ impl QuerySet {
 #[derive(Clone, Debug, Error)]
 #[non_exhaustive]
 pub enum DestroyError {
-    #[error("Resource is invalid")]
-    Invalid,
     #[error("Resource is already destroyed")]
     AlreadyDestroyed,
+    #[error(transparent)]
+    InvalidResource(#[from] InvalidResourceError),
 }

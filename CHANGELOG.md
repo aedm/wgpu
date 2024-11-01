@@ -78,6 +78,7 @@ By @teoxoy [#6134](https://github.com/gfx-rs/wgpu/pull/6134).
 ### Bug Fixes
 
 - Fix incorrect hlsl image output type conversion. By @atlv24 in [#6123](https://github.com/gfx-rs/wgpu/pull/6123)
+- Fix crash when a texture argument is missing. By @aedm in [#6486](https://github.com/gfx-rs/wgpu/pull/6486)
 
 #### Naga
 

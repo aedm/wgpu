@@ -315,9 +315,8 @@ fn main() {{
 #[cfg(feature = "wgsl-in")]
 #[test]
 fn validation_error_messages() {
-    let cases = [
-        (
-            r#"@group(0) @binding(0) var my_sampler: sampler;
+    let cases = [(
+        r#"@group(0) @binding(0) var my_sampler: sampler;
 
                 fn foo(tex: texture_2d<f32>) -> vec4<f32> {
                     return textureSampleLevel(tex, my_sampler, vec2f(0, 0), 0.0);
@@ -327,7 +326,7 @@ fn validation_error_messages() {
                     foo();
                 }
             "#,
-            "\
+        "\
 error: Function [1] 'main' is invalid
   ┌─ wgsl:7:17
   │  \n7 │ ╭                 fn main() {
@@ -338,8 +337,7 @@ error: Function [1] 'main' is invalid
   = Requires 1 arguments, but 0 are provided
 
 ",
-        ),
-    ];
+    )];
 
     for (source, expected_err) in cases {
         let module = naga::front::wgsl::parse_str(&source).unwrap();

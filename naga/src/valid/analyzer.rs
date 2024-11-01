@@ -421,7 +421,10 @@ impl FunctionInfo {
             let image_storage = match sampling.image {
                 GlobalOrArgument::Global(var) => GlobalOrArgument::Global(var),
                 GlobalOrArgument::Argument(i) => {
-                    let handle = arguments[i as usize];
+                    let Some(handle) = arguments.get(i as usize).cloned() else {
+                        // Argument mismatch, will be reported later by validate_call
+                        continue;
+                    };
                     GlobalOrArgument::from_expression(expression_arena, handle).map_err(
                         |source| {
                             FunctionError::Expression { handle, source }
@@ -434,7 +437,10 @@ impl FunctionInfo {
             let sampler_storage = match sampling.sampler {
                 GlobalOrArgument::Global(var) => GlobalOrArgument::Global(var),
                 GlobalOrArgument::Argument(i) => {
-                    let handle = arguments[i as usize];
+                    let Some(handle) = arguments.get(i as usize).cloned() else {
+                        // Argument mismatch, will be reported later by validate_call
+                        continue;
+                    };
                     GlobalOrArgument::from_expression(expression_arena, handle).map_err(
                         |source| {
                             FunctionError::Expression { handle, source }

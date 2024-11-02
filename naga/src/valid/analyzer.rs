@@ -422,8 +422,8 @@ impl FunctionInfo {
                 GlobalOrArgument::Global(var) => GlobalOrArgument::Global(var),
                 GlobalOrArgument::Argument(i) => {
                     let Some(handle) = arguments.get(i as usize).cloned() else {
-                        // Argument mismatch, will be reported later by validate_call
-                        continue;
+                        // Argument count mismatch, will be reported later by validate_call
+                        break;
                     };
                     GlobalOrArgument::from_expression(expression_arena, handle).map_err(
                         |source| {
@@ -438,8 +438,8 @@ impl FunctionInfo {
                 GlobalOrArgument::Global(var) => GlobalOrArgument::Global(var),
                 GlobalOrArgument::Argument(i) => {
                     let Some(handle) = arguments.get(i as usize).cloned() else {
-                        // Argument mismatch, will be reported later by validate_call
-                        continue;
+                        // Argument count mismatch, will be reported later by validate_call
+                        break;
                     };
                     GlobalOrArgument::from_expression(expression_arena, handle).map_err(
                         |source| {

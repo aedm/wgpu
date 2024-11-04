@@ -53,6 +53,12 @@ Bottom level categories:
 
 - Change the `DropCallback` API to use `FnOnce` instead of `FnMut`. By @jerzywilczek in [#6482](https://github.com/gfx-rs/wgpu/pull/6482)
 
+### Bug Fixes
+
+#### Naga
+
+- Fix crash when a texture argument is missing. By @aedm in [#6486](https://github.com/gfx-rs/wgpu/pull/6486)
+
 ## 23.0.0 (2024-10-25)
 
 ### Themes of this release
@@ -221,7 +227,6 @@ By @MarijnS95 in [#6006](https://github.com/gfx-rs/wgpu/pull/6006).
 - Matrices can now be indexed by value (#4337), and indexing arrays by value no longer causes excessive spilling (#6358). By @jimblandy in [#6390](https://github.com/gfx-rs/wgpu/pull/6390).
 - Add support for `textureQueryLevels` to the GLSL parser. By @magcius in [#6325](https://github.com/gfx-rs/wgpu/pull/6415).
 - Fix unescaped identifiers in the Metal backend shader I/O structures causing shader miscompilation. By @ErichDonGubler in [#6438](https://github.com/gfx-rs/wgpu/pull/6438).
-- Fix crash when a texture argument is missing. By @aedm in [#6486](https://github.com/gfx-rs/wgpu/pull/6486)
 
 #### General
 

@@ -635,11 +635,11 @@ error: Function [1] 'main' is invalid
     )];
 
     for (source, expected_err) in cases {
-        let module = naga::front::wgsl::parse_str(&source).unwrap();
+        let module = naga::front::wgsl::parse_str(source).unwrap();
         let err = valid::Validator::new(Default::default(), valid::Capabilities::all())
             .validate_no_overrides(&module)
             .expect_err("module should be invalid");
-        println!("{}", err.emit_to_string(&source));
-        assert_eq!(err.emit_to_string(&source), expected_err);
+        println!("{}", err.emit_to_string(source));
+        assert_eq!(err.emit_to_string(source), expected_err);
     }
 }
